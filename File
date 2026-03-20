@@ -1,0 +1,276 @@
+package main
+
+import (
+	"encoding/json"
+	"fmt"
+	"net/http"
+	"sync"
+	"time"
+)
+
+type Message struct {
+	Author string `json:"author"`
+	Text   string `json:"text"`
+	Time   string `json:"time"`
+}
+
+type Player struct {
+	Name     string    `json:"name"`
+	HP       int       `json:"hp"`
+	MaxHP    int       `json:"max_hp"`
+	Level    int       `json:"level"`
+	Strength int       `json:"strength"`
+	TargetID string    `json:"target_id"` // Имя противника
+	LastSeen time.Time `json:"-"`
+}
+
+type BattleMove struct {
+	Attack string `json:"attack"` // head, torso, legs
+	Defend string `json:"defend"` // head, torso, legs
+}
+
+type GameState struct {
+	Players  map[string]*Player `json:"players"`
+	Messages []Message          `json:"messages"`
+}
+
+var (
+	state = GameState{
+		Players:  make(map[string]*Player),
+		Messages: []Message{{Author: "Система", Text: "Мир запущен!", Time: ""}},
+	}
+	// Хранилище ходов: [PlayerName]BattleMove
+	pendingMoves = make(map[string]BattleMove)
+	mu           sync.Mutex
+)
+
+func main() {
+	http.HandleFunc("/sync", handleSync)
+	http.HandleFunc("/chat", handleChat)
+	http.HandleFunc("/move", handleMove)
+
+	fmt.Println("Сервер PvP запущен на :8080")
+	http.ListenAndServe(":8080", nil)
+}
+
+func handleSync(w http.ResponseWriter, r *http.Request) {
+	mu.Lock()
+	defer mu.Unlock()
+	if r.Method == http.MethodPost {
+		var p Player
+		if err := json.NewDecoder(r.Body).Decode(&p); err == nil {
+			p.LastSeen = time.Now()
+			state.Players[p.Name] = &p
+		}
+	}
+	json.NewEncoder(w).Encode(state)
+}
+
+func handleChat(w http.ResponseWriter, r *http.Request) {
+	if r.Method == http.MethodPost {
+		var msg Message
+		if err := json.NewDecoder(r.Body).Decode(&msg); err == nil {
+			mu.Lock()
+			msg.Time = time.Now().Format("15:04")
+			state.Messages = append(state.Messages, msg)
+			mu.Unlock()
+		}
+	}
+}
+
+func handleMove(w http.ResponseWriter, r *http.Request) {
+	mu.Lock()
+	defer mu.Unlock()
+
+	var req struct {
+		PlayerName string     `json:"player_name"`
+		Move       BattleMove `json:"move"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		return
+	}
+
+	pendingMoves[req.PlayerName] = req.Move
+	p1 := state.Players[req.PlayerName]
+	p2Name := p1.TargetID
+	
+	// Если противник тоже походил — считаем результат
+	if m2, ok := pendingMoves[p2Name]; ok {
+		m1 := req.Move
+		p2 := state.Players[p2Name]
+
+		// Логика: если атака p1 не совпала с защитой p2 -> урон
+		res1 := calculateDamage(p1, p2, m1.Attack, m2.Defend)
+		res2 := calculateDamage(p2, p1, m2.Attack, m1.Defend)
+
+		state.Messages = append(state.Messages, Message{
+			Author: "Бой",
+			Text:   fmt.Sprintf("%s -> %s (%d), %s -> %s (%d)", p1.Name, p2.Name, res1, p2.Name, p1.Name, res2),
+			Time:   time.Now().Format("15:04"),
+		})
+
+		delete(pendingMoves, p1.Name)
+		delete(pendingMoves, p2Name)
+	}
+}
+
+func calculateDamage(att *Player, def *Player, atkPart, defPart string) int {
+	if atkPart == defPart {
+		return 0 // Заблокировано
+	}
+	dmg := att.Strength
+	def.HP -= dmg
+	if def.HP < 0 { def.HP = 0 }
+	return dmg
+}
+_________%-_-_+_+%+%++₽+₽+₽+%+₽+₽+₽+₽+₽+₽+₽+%;₽+%;₽;₽;₽
+package main
+
+import (
+	"bytes"
+	"encoding/json"
+	"fmt"
+	"net/http"
+	"time"
+
+	"github.com/gdamore/tcell/v2"
+	"github.com/rivo/tview"
+)
+
+type Character struct {
+	Name     string `json:"name"`
+	HP       int    `json:"hp"`
+	MaxHP    int    `json:"max_hp"`
+	Level    int    `json:"level"`
+	Strength int    `json:"strength"`
+	TargetID string `json:"target_id"` // Кто наш враг
+}
+
+type GameState struct {
+	Players  map[string]Character `json:"players"`
+	Messages []Message            `json:"messages"`
+}
+
+type Message struct {
+	Author string `json:"author"`
+	Text   string `json:"text"`
+	Time   string `json:"time"`
+}
+
+var (
+	hero      Character
+	app       *tview.Application
+	pages     *tview.Pages
+	chatView  *tview.TextView
+	pList     *tview.TextView
+	serverURL = "http://localhost:8080" // Замени на свой URL
+	inBattle  bool
+)
+
+func networkLoop() {
+	for {
+		data, _ := json.Marshal(hero)
+		resp, err := http.Post(serverURL+"/sync", "application/json", bytes.NewBuffer(data))
+		if err == nil {
+			var gs GameState
+			json.NewDecoder(resp.Body).Decode(&gs)
+			resp.Body.Close()
+
+			app.QueueUpdateDraw(func() {
+				updateUI(gs)
+				// Если сервер назначил нам врага, а мы еще не в экране боя
+				if gs.Players[hero.Name].TargetID != "" && !inBattle {
+					hero.TargetID = gs.Players[hero.Name].TargetID
+					startPvPPhase()
+				}
+				// Если бой закончился (HP 0 или TargetID пуст)
+				if gs.Players[hero.Name].TargetID == "" && inBattle {
+					inBattle = false
+					pages.SwitchToPage("menu")
+				}
+                hero.HP = gs.Players[hero.Name].HP
+			})
+		}
+		time.Sleep(1 * time.Second)
+	}
+}
+
+func updateUI(gs GameState) {
+	pList.Clear()
+	fmt.Fprintln(pList, "[yellow]ИГРОКИ (Клик для боя):[-]")
+	for _, p := range gs.Players {
+		if p.Name == hero.Name { continue }
+		fmt.Fprintf(pList, "• %s (HP: %d)\n", p.Name, p.HP)
+	}
+	chatView.Clear()
+	for _, m := range gs.Messages {
+		fmt.Fprintf(chatView, "[gray]%s[-] [blue]%s:[-] %s\n", m.Time, m.Author, m.Text)
+	}
+}
+
+func startPvPPhase() {
+	inBattle = true
+	var attack, defend string
+
+	form := tview.NewForm().
+		AddDropDown("Атака", []string{"head", "torso", "legs"}, 0, func(o string, i int) { attack = o }).
+		AddDropDown("Защита", []string{"head", "torso", "legs"}, 0, func(o string, i int) { defend = o }).
+		AddButton("Ударить!", func() {
+			sendMove(attack, defend)
+		})
+	
+	form.SetBorder(true).SetTitle(fmt.Sprintf(" БОЙ ПРОТИВ %s ", hero.TargetID))
+	pages.AddPage("pvp", form, true, true)
+}
+
+func sendMove(atk, def string) {
+	moveData := map[string]interface{}{
+		"player_name": hero.Name,
+		"move": map[string]string{"attack": atk, "defend": def},
+	}
+	b, _ := json.Marshal(moveData)
+	go http.Post(serverURL+"/move", "application/json", bytes.NewBuffer(b))
+	
+	// Показываем заглушку ожидания
+	wait := tview.NewModal().SetText("Ожидание хода противника...")
+	pages.AddPage("wait", wait, true, true)
+}
+
+// --- Остальной код (Main, showMenu, и т.д.) идентичен твоему, с заменой URL ---
+
+func main() {
+	app = tview.NewApplication()
+	pages = tview.NewPages()
+	
+	regForm := tview.NewForm()
+	regForm.AddInputField("Имя", "", 20, nil, nil).AddButton("Войти", func() {
+		hero.Name = regForm.GetFormItem(0).(*tview.InputField).GetText()
+		hero.HP, hero.MaxHP, hero.Strength = 100, 100, 15
+		showMenu()
+		pages.SwitchToPage("menu")
+	})
+	
+	pages.AddPage("init", regForm, true, true)
+	go networkLoop()
+	app.SetRoot(pages, true).Run()
+}
+
+func showMenu() {
+	list := tview.NewList().
+		AddItem("Вызвать на бой", "Введите имя игрока", '1', func() {
+			// Упрощенно: вызываем первого встречного для теста или через ввод
+			hero.TargetID = "EnemyName" // В реале тут нужен ввод имени
+		}).
+		AddItem("Выход", "", 'q', func() { app.Stop() })
+
+	chatView = tview.NewTextView().SetDynamicColors(true)
+	chatView.SetBorder(true).SetTitle(" ЧАТ ")
+	pList = tview.NewTextView().SetDynamicColors(true).SetBorder(true)
+
+	flex := tview.NewFlex().
+		AddItem(list, 20, 1, true).
+		AddItem(chatView, 0, 2, false).
+		AddItem(pList, 25, 1, false)
+
+	pages.AddPage("menu", flex, true, true)
+}
