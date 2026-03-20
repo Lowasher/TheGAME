@@ -1,0 +1,304 @@
+===========================SERVER============================
+package main
+
+import (
+	"encoding/json"
+	"fmt"
+	"net/http"
+	"sync"
+	"time"
+)
+
+type Message struct {
+	Author string `json:"author"`
+	Text   string `json:"text"`
+	Time   string `json:"time"`
+}
+
+type Player struct {
+	Name     string `json:"name"`
+	HP       int    `json:"hp"`
+	MaxHP    int    `json:"max_hp"`
+	Level    int    `json:"level"`
+	Strength int    `json:"strength"`
+	LastSeen time.Time `json:"-"` // Для очистки вышедших игроков
+}
+
+type GameState struct {
+	Players  map[string]*Player `json:"players"`
+	Messages []Message          `json:"messages"`
+}
+
+var (
+	state = GameState{
+		Players:  make(map[string]*Player),
+     Messages: []Message{{Author: "Система", Text: "Добро пожаловать в RPG!", Time: ""}},
+	}
+	mu sync.Mutex
+)
+
+func main() {
+	// Основной эндпоинт для синхронизации
+	http.HandleFunc("/sync", func(w http.ResponseWriter, r *http.Request) {
+		mu.Lock()
+		defer mu.Unlock()
+
+		if r.Method == http.MethodPost {
+			var p Player
+			if err := json.NewDecoder(r.Body).Decode(&p); err == nil {
+				p.LastSeen = time.Now()
+				state.Players[p.Name] = &p
+			}
+		}
+		json.NewEncoder(w).Encode(state)
+	})
+
+	// Эндпоинт для отправки сообщений в чат
+	http.HandleFunc("/chat", func(w http.ResponseWriter, r *http.Request) {
+		if r.Method == http.MethodPost {
+			var msg Message
+			if err := json.NewDecoder(r.Body).Decode(&msg); err == nil {
+				mu.Lock()
+				msg.Time = time.Now().Format("15:04")
+				state.Messages = append(state.Messages, msg)
+				if len(state.Messages) > 20 { // Храним последние 20 сообщений
+					state.Messages = state.Messages[1:]
+				}
+				mu.Unlock()
+			}
+		}
+	})
+
+	fmt.Println("Сервер запущен на :8080")
+	http.ListenAndServe(":8080", nil)
+}
+
+
+
+========================Client============================
+package main
+
+import (
+	"bytes"
+	"encoding/json"
+	"fmt"
+	"math/rand"
+	"net/http"
+	"time"
+
+	"github.com/gdamore/tcell/v2" // Добавили для работы с клавишами
+	"github.com/rivo/tview"
+)
+
+// --- СТРУКТУРЫ ДАННЫХ ---
+
+type Item struct {
+	Name  string
+	Type  string
+	Value int
+}
+
+type Character struct {
+	Name      string           `json:"name"`
+	HP        int              `json:"hp"`
+	MaxHP     int              `json:"max_hp"`
+	Level     int              `json:"level"`
+	Money     int              `json:"money"`
+	Exp       int              `json:"exp"`
+	Strength  int              `json:"strength"`
+	Armor     int              `json:"armor"`
+	Inventory []Item           `json:"-"`
+	Equipped  map[string]*Item `json:"-"`
+}
+
+type Message struct {
+	Author string `json:"author"`
+	Text   string `json:"text"`
+	Time   string `json:"time"`
+}
+
+type GameState struct {
+	Players  map[string]Character `json:"players"`
+	Messages []Message            `json:"messages"`
+}
+
+// --- ГЛОБАЛЬНЫЕ ПЕРЕМЕННЫЕ ---
+
+var (
+	hero        Character
+	app         *tview.Application
+	pages       *tview.Pages
+	chatView    *tview.TextView
+	playersList *tview.TextView
+	// URL очищен от лишнего слэша в конце
+	serverURL = "https://orange-waddle-v6q56qx6qg6q3x6g9-8080.app.github.dev" 
+)
+
+func initHero(name string) {
+	hero = Character{
+		Name:     name,
+		HP:       100,
+		MaxHP:    100,
+		Level:    1,
+		Strength: 10,
+		Money:    100,
+		Inventory: []Item{
+			{Name: "Ржавый меч", Type: "Weapon", Value: 5},
+			{Name: "Зелье жизни", Type: "Potion", Value: 30},
+		},
+	}
+}
+
+// --- СЕТЕВАЯ ЛОГИКА ---
+
+func networkLoop() {
+	for {
+		data, _ := json.Marshal(hero)
+		resp, err := http.Post(serverURL+"/sync", "application/json", bytes.NewBuffer(data))
+		if err == nil {
+			var gs GameState
+			if err := json.NewDecoder(resp.Body).Decode(&gs); err == nil {
+				app.QueueUpdateDraw(func() {
+					updateUI(gs)
+				})
+			}
+			resp.Body.Close()
+		}
+		time.Sleep(1 * time.Second)
+	}
+}
+
+func sendMessage(text string) {
+	if text == "" { return }
+	msg := Message{Author: hero.Name, Text: text}
+	data, _ := json.Marshal(msg)
+	go http.Post(serverURL+"/chat", "application/json", bytes.NewBuffer(data))
+}
+
+func updateUI(gs GameState) {
+	playersList.Clear()
+	fmt.Fprintln(playersList, "[yellow]ИГРОКИ ОНЛАЙН:[-]")
+	for _, p := range gs.Players {
+		color := "white"
+		if p.Name == hero.Name { color = "green" }
+		fmt.Fprintf(playersList, "[%s]• %s (HP: %d)[-]\n", color, p.Name, p.HP)
+	}
+
+	chatView.Clear()
+	for _, m := range gs.Messages {
+		fmt.Fprintf(chatView, "[gray]%s[-] [blue]%s:[-] %s\n", m.Time, m.Author, m.Text)
+	}
+}
+
+// --- ИНТЕРФЕЙС ---
+
+func drawStats() *tview.TextView {
+	view := tview.NewTextView().SetDynamicColors(true)
+	go func() {
+		for {
+			app.QueueUpdateDraw(func() {
+				view.Clear()
+				fmt.Fprintf(view, "\n [yellow]ГЕРОЙ:[-] %s\n", hero.Name)
+				fmt.Fprintf(view, " [red]HP:[-] %d/%d\n", hero.HP, hero.MaxHP)
+				fmt.Fprintf(view, " [green]LVL:[-] %d\n", hero.Level)
+				fmt.Fprintf(view, " [blue]GOLD:[-] %d\n", hero.Money)
+			})
+			time.Sleep(1 * time.Second)
+		}
+	}()
+	view.SetBorder(true).SetTitle(" СТАТУС ")
+	return view
+}
+
+func showMenu() {
+	menuList := tview.NewList().
+		AddItem("В лес (PvE)", "Бой с мобом", '1', func() { startBattle() }).
+		AddItem("Выход", "", 'q', func() { app.Stop() })
+	menuList.SetBorder(true).SetTitle(" ДЕЙСТВИЯ ")
+
+	chatView = tview.NewTextView().SetDynamicColors(true).SetWordWrap(true)
+	chatView.SetBorder(true).SetTitle(" ОБЩИЙ ЧАТ ")
+
+	inputField := tview.NewInputField().SetLabel("> ").SetFieldWidth(0)
+	// Исправлено использование tcell.KeyEnter
+	inputField.SetDoneFunc(func(key tcell.Key) {
+		if key == tcell.KeyEnter {
+			sendMessage(inputField.GetText())
+			inputField.SetText("")
+		}
+	})
+	inputField.SetBorder(true).SetTitle(" СООБЩЕНИЕ (Enter) ")
+
+	playersList = tview.NewTextView().SetDynamicColors(true)
+	playersList.SetBorder(true).SetTitle(" МИР ")
+
+	chatFlex := tview.NewFlex().SetDirection(tview.FlexRow).
+		AddItem(chatView, 0, 1, false).
+		AddItem(inputField, 3, 1, true)
+
+	mainFlex := tview.NewFlex().
+		AddItem(menuList, 20, 1, true).
+		AddItem(chatFlex, 0, 2, false).
+		AddItem(tview.NewFlex().SetDirection(tview.FlexRow).
+			AddItem(drawStats(), 10, 1, false).
+			AddItem(playersList, 0, 1, false), 25, 1, false)
+
+	pages.AddPage("menu", mainFlex, true, true)
+	go networkLoop()
+}
+
+func startBattle() {
+	mHP := 50
+	battleInfo := tview.NewTextView().SetDynamicColors(true)
+	fmt.Fprintf(battleInfo, "[red]Враг: Дикий Орк (HP: %d)[-]\n", mHP)
+
+	battleList := tview.NewList().
+		AddItem("Атака", "", 'a', func() {
+			dmg := hero.Strength + rand.Intn(5)
+			mHP -= dmg
+			hero.HP -= rand.Intn(10)
+			battleInfo.Clear()
+			fmt.Fprintf(battleInfo, "[red]Враг: Орк (HP: %d)[-]\nВы ударили на [yellow]%d[-]!\n", mHP, dmg)
+			if mHP <= 0 {
+				hero.Exp += 20
+				hero.Money += 10
+				pages.SwitchToPage("menu")
+			}
+			if hero.HP <= 0 {
+				hero.HP = 100 // Респаун
+				pages.SwitchToPage("menu")
+			}
+		}).
+		AddItem("Сбежать", "", 'e', func() { pages.SwitchToPage("menu") })
+
+	layout := tview.NewFlex().SetDirection(tview.FlexRow).
+		AddItem(battleInfo, 0, 1, false).
+		AddItem(battleList, 10, 1, true)
+	
+	layout.SetBorder(true).SetTitle(" БОЙ ")
+	pages.AddPage("battle", layout, true, true)
+}
+
+func main() {
+	rand.Seed(time.Now().UnixNano())
+	app = tview.NewApplication().EnableMouse(true)
+	pages = tview.NewPages()
+
+	form := tview.NewForm()
+	form.AddInputField("Имя героя", "Странник", 20, nil, nil)
+	form.AddButton("Войти", func() {
+		// Исправленный способ получения текста из InputField
+		name := form.GetFormItem(0).(*tview.InputField).GetText()
+		if name == "" { name = "Странник" }
+		initHero(name)
+		showMenu()
+		pages.SwitchToPage("menu")
+	})
+	
+	form.SetBorder(true).SetTitle(" РЕГИСТРАЦИЯ ")
+	pages.AddPage("init", form, true, true)
+
+	if err := app.SetRoot(pages, true).Run(); err != nil {
+		panic(err)
+	}
+}
